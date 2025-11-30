@@ -34,7 +34,6 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
     pitchNorm: number;
   } | null>(null);
 
-  // ✅ captures value is now used later (nextInstruction), so TS6133 is gone
   const [captures, setCaptures] = useState<Partial<Record<Direction, string>>>(
     {}
   );
@@ -55,299 +54,7 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
   // detectForVideo needs a monotonic timestamp
   const lastTsRef = useRef(0);
 
-  // ----------------------- CAMERA (with robust getUserMedia guard) -----------------------
-  useEffect(() => {
-    let mounted = true;
-
-    const safePlay = async () => {
-      const videoEl = videoRef.current;
-      if (!videoEl) return;
-      try {
-        await videoEl.play();
-      } catch (e) {
-        console.warn("video.play() failed:", e);
-      }
-    };
-
-    const onLoadedData = () => {
-      // Safari sometimes ignores play() unless you retry on loadeddata
-      safePlay();
-      setVideoReady(true);
-    };
-
-    (async () => {
-      try {
-        // ✅ Guard: only run when navigator exists (no SSR)
-        if (typeof navigator === "undefined") {
-          console.warn(
-            "[FaceCircleCapture5] navigator is undefined (SSR or non-browser env)"
-          );
-          setError("Camera not available in this environment.");
-          return;
-        }
-
-        // ✅ Guard: check mediaDevices + getUserMedia
-        const navAny = navigator as any;
-        const mediaDevices: MediaDevices | undefined =
-          (navigator as any).mediaDevices || navAny.mediaDevices;
-
-        if (!mediaDevices || typeof mediaDevices.getUserMedia !== "function") {
-          console.warn(
-            "[FaceCircleCapture5] navigator.mediaDevices.getUserMedia is not available",
-            navigator
-          );
-          setError("This browser does not support camera access.");
-          return;
-        }
-
-        // ✅ Request front camera explicitly
-        const stream = await mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "user" },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
-        });
-
-        if (!mounted) {
-          // If we unmounted while permission prompt was open
-          if (isIOS()) stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
-        streamRef.current = stream;
-
-        const videoEl = videoRef.current;
-        if (!videoEl) return;
-
-        videoEl.srcObject = stream;
-
-        // iOS Safari playsInline must be set as attributes (not only React prop)
-        videoEl.setAttribute("playsinline", "true");
-        videoEl.setAttribute("webkit-playsinline", "true");
-        videoEl.muted = true; // helps autoplay on mobile
-
-        // metadata -> play attempt #1
-        videoEl.onloadedmetadata = () => {
-          safePlay();
-          setVideoReady(true);
-        };
-
-        // play attempt #2 (Safari reliability)
-        videoEl.addEventListener("loadeddata", onLoadedData);
-
-        // In case metadata never fires on some devices
-        safePlay();
-      } catch (e: any) {
-        console.error("[FaceCircleCapture5] getUserMedia error:", e);
-        const name = e?.name || "Error";
-        setError(`Camera access failed: ${name}`);
-      }
-    })();
-
-    return () => {
-      mounted = false;
-
-      const videoEl = videoRef.current;
-      videoEl?.removeEventListener("loadeddata", onLoadedData);
-      if (videoEl) videoEl.onloadedmetadata = null;
-
-      // Stop tracks ONLY on iOS; do NOT stop on Android (prevents “won’t reopen” issues)
-      if (isIOS()) {
-        const tracks = streamRef.current?.getTracks() ?? [];
-        tracks.forEach((t) => t.stop());
-        streamRef.current = null;
-      }
-
-      // Detach element either way (safe UI cleanup)
-      if (videoEl) videoEl.srcObject = null;
-      setVideoReady(false);
-    };
-  }, []);
-
-  // ------------------ MEDIAPIPE INIT (with SIMD + noSIMD fallback) ------------------
-  useEffect(() => {
-    let alive = true;
-
-    (async () => {
-      try {
-        let vision: any;
-
-        try {
-          // SIMD first
-          vision = await FilesetResolver.forVisionTasks("/mediapipe");
-        } catch (e) {
-          console.warn(
-            "MediaPipe SIMD init failed, falling back to no-SIMD:",
-            e
-          );
-          // In this example we just retry the same path; in a real app you might load a different bundle
-          vision = await FilesetResolver.forVisionTasks("/mediapipe");
-        }
-
-        const lm = await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: "/mediapipe/face_landmarker.task",
-          },
-          runningMode: "VIDEO",
-          numFaces: 1,
-        });
-
-        if (!alive) {
-          lm.close?.();
-          return;
-        }
-
-        setFaceLandmarker(lm);
-      } catch (e) {
-        console.error(e);
-        setError("Model load failed");
-      }
-    })();
-
-    return () => {
-      alive = false;
-      // best-effort cleanup
-      setFaceLandmarker((prev) => {
-        prev?.close?.();
-        return null;
-      });
-    };
-  }, []);
-
-  // ------------------ DETECTION LOOP (detectForVideo) ------------------
-  useEffect(() => {
-    let interval: number;
-
-    function detect() {
-      try {
-        if (!faceLandmarker || !videoRef.current) return;
-
-        const videoEl = videoRef.current;
-
-        // Need current frame data
-        if (!videoEl || videoEl.readyState < 2) return;
-
-        const w = videoEl.videoWidth;
-        const h = videoEl.videoHeight;
-        if (!w || !h) return;
-
-        // monotonic timestamp
-        const now = performance.now();
-        const ts = now <= lastTsRef.current ? lastTsRef.current + 1 : now;
-        lastTsRef.current = ts;
-
-        // FAST + correct for VIDEO mode
-        const res = faceLandmarker.detectForVideo(videoEl, ts);
-
-        if (res.faceLandmarks?.[0]) {
-          const lm = res.faceLandmarks[0];
-
-          const noseX = lm[1].x;
-          const leftEyeOuterX = lm[33].x;
-          const rightEyeOuterX = lm[263].x;
-          const eyeCenterX = (leftEyeOuterX + rightEyeOuterX) / 2;
-
-          const mouthY = lm[13].y;
-          const leftEyeOuterY = lm[33].y;
-          const rightEyeOuterY = lm[263].y;
-          const eyeCenterY = (leftEyeOuterY + rightEyeOuterY) / 2;
-
-          const yawNorm = noseX - eyeCenterX;
-          const pitchNorm = mouthY - eyeCenterY;
-
-          const basics = { yawNorm, pitchNorm };
-          liveInfoRef.current.basics = basics;
-
-          // Gate → Detect
-          if (phase === "gate") {
-            const now2 = performance.now();
-            if (!gateHoldRef.current) gateHoldRef.current = now2;
-            else if (now2 - gateHoldRef.current >= GATE_HOLD_MS) {
-              setPhase("detect");
-              gateHoldRef.current = null;
-              straightStartRef.current = null;
-              bestStraightRef.current = null;
-            }
-          }
-
-          if (phase === "detect" && !baseline) {
-            if (!straightStartRef.current)
-              straightStartRef.current = performance.now();
-
-            if (
-              !bestStraightRef.current ||
-              straightScore(basics) > straightScore(bestStraightRef.current)
-            ) {
-              bestStraightRef.current = basics;
-            }
-          }
-        } else {
-          liveInfoRef.current.basics = null;
-          if (phase === "gate") gateHoldRef.current = null;
-        }
-      } catch (e) {
-        console.warn("detectForVideo failed:", e);
-      }
-    }
-
-    interval = window.setInterval(detect, 110);
-    return () => clearInterval(interval);
-  }, [faceLandmarker, baseline, phase]);
-
-  // ------------------- DRAWING LOOP -------------------
-  useEffect(() => {
-    let frameId: number;
-
-    const draw = () => {
-      const canvas = canvasRef.current;
-      const container = containerRef.current;
-      if (!canvas || !container) {
-        frameId = requestAnimationFrame(draw);
-        return;
-      }
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        frameId = requestAnimationFrame(draw);
-        return;
-      }
-
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      canvas.width = w;
-      canvas.height = h;
-      ctx.clearRect(0, 0, w, h);
-
-      const basics = liveInfoRef.current.basics;
-
-      if (
-        phase === "detect" &&
-        videoReady &&
-        basics &&
-        !isCapturingRef.current &&
-        !showDone
-      ) {
-        if (!baseline) handleStraightPhase(basics);
-        else runDirectionStep(basics, baseline);
-      }
-
-      if (phase === "detect" && baseline) {
-        drawPins4(ctx, w, h, capturesRef.current, currentDir);
-      }
-
-      frameId = requestAnimationFrame(draw);
-    };
-
-    frameId = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frameId);
-  }, [baseline, videoReady, currentDir, showDone, phase]);
-
-  // ----------------- STRAIGHT PHASE -----------------
-  function handleStraightPhase(basics: FaceBasics) {
-    const now = performance.now();
-
+  function handleStraightPhase(basics: FaceBasics, now: number) {
     if (
       straightStartRef.current &&
       now - straightStartRef.current > STRAIGHT_GIVEUP_MS &&
@@ -390,7 +97,11 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
   }
 
   // ----------------- DIRECTION LOGIC -----------------
-  function runDirectionStep(basics: FaceBasics, baseline0: FaceBasics) {
+  function runDirectionStep(
+    basics: FaceBasics,
+    baseline0: FaceBasics,
+    now: number
+  ) {
     const relYaw = basics.yawNorm - baseline0.yawNorm;
     const relPitch = basics.pitchNorm - baseline0.pitchNorm;
 
@@ -411,7 +122,6 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
     if (!dir) return;
     if (capturesRef.current[dir]) return;
 
-    const now = performance.now();
     const prev = holdStartRef.current[dir] ?? null;
 
     if (!prev) holdStartRef.current[dir] = now;
@@ -422,6 +132,7 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
   }
 
   // ----------------- CAPTURE LOGIC -----------------
+  // ----------------- CAPTURE LOGIC -----------------
   function doCapture(dir: Direction) {
     const videoEl = videoRef.current;
     if (!videoEl) return;
@@ -429,6 +140,11 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
     const w = videoEl.videoWidth;
     const h = videoEl.videoHeight;
     if (!w || !h) return;
+
+    // 🔍 Log the actual resolution used for capture
+    console.log(
+      `[FaceCircleCapture5] Capturing "${dir}" at resolution: ${w}x${h}`
+    );
 
     const c = document.createElement("canvas");
     c.width = w;
@@ -508,6 +224,343 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
     }
     return null;
   })();
+
+  // ----------------------- CAMERA (with robust getUserMedia guard) -----------------------
+  useEffect(() => {
+    let mounted = true;
+
+    const safePlay = async () => {
+      const videoEl = videoRef.current;
+      if (!videoEl) return;
+      try {
+        await videoEl.play();
+      } catch (e) {
+        console.warn("video.play() failed:", e);
+      }
+    };
+
+    const onLoadedData = () => {
+      const videoEl = videoRef.current;
+      if (videoEl) {
+        console.log(
+          "[FaceCircleCapture5] onloadeddata – stream size:",
+          videoEl.videoWidth,
+          "x",
+          videoEl.videoHeight
+        );
+      }
+      // Safari sometimes ignores play() unless you retry on loadeddata
+      safePlay();
+      setVideoReady(true);
+    };
+
+    (async () => {
+      try {
+        // ✅ Guard: only run when navigator exists (no SSR)
+        if (typeof navigator === "undefined") {
+          console.warn(
+            "[FaceCircleCapture5] navigator is undefined (SSR or non-browser env)"
+          );
+          setError("Camera not available in this environment.");
+          return;
+        }
+
+        // ✅ Guard: check mediaDevices + getUserMedia
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const navAny = navigator as any;
+        const mediaDevices: MediaDevices | undefined =
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (navigator as any).mediaDevices || navAny.mediaDevices;
+
+        if (!mediaDevices || typeof mediaDevices.getUserMedia !== "function") {
+          console.warn(
+            "[FaceCircleCapture5] navigator.mediaDevices.getUserMedia is not available",
+            navigator
+          );
+          setError("This browser does not support camera access.");
+          return;
+        }
+
+        // ✅ Request front camera explicitly, with high 'ideal' resolution
+        const stream = await mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "user" },
+            width: { ideal: 3840 }, // ask for up to 4K
+            height: { ideal: 2160 },
+          },
+          audio: false,
+        });
+
+        // ⬇️ Try to push the track to its max capabilities
+        const [videoTrack] = stream.getVideoTracks();
+        if (videoTrack && typeof videoTrack.getCapabilities === "function") {
+          const caps = videoTrack.getCapabilities();
+          const constraints: MediaTrackConstraints = {};
+
+          if (caps.width && typeof caps.width.max === "number") {
+            constraints.width = caps.width.max;
+          }
+          if (caps.height && typeof caps.height.max === "number") {
+            constraints.height = caps.height.max;
+          }
+
+          if (caps.facingMode && caps.facingMode.length) {
+            constraints.facingMode = { ideal: "user" };
+          }
+
+          try {
+            await videoTrack.applyConstraints(constraints);
+            console.log(
+              "[FaceCircleCapture5] applied max constraints:",
+              constraints
+            );
+          } catch (err) {
+            console.warn(
+              "[FaceCircleCapture5] applyConstraints failed, using negotiated resolution:",
+              err
+            );
+          }
+        }
+
+        if (!mounted) {
+          // If we unmounted while permission prompt was open
+          if (isIOS()) stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        streamRef.current = stream;
+
+        const videoEl = videoRef.current;
+        if (!videoEl) return;
+
+        videoEl.srcObject = stream;
+
+        // iOS Safari playsInline must be set as attributes (not only React prop)
+        videoEl.setAttribute("playsinline", "true");
+        videoEl.setAttribute("webkit-playsinline", "true");
+        videoEl.muted = true; // helps autoplay on mobile
+
+        // metadata -> play attempt #1 + log actual resolution
+        videoEl.onloadedmetadata = () => {
+          console.log(
+            "[FaceCircleCapture5] onloadedmetadata – stream size:",
+            videoEl.videoWidth,
+            "x",
+            videoEl.videoHeight
+          );
+          safePlay();
+          setVideoReady(true);
+        };
+
+        // play attempt #2 (Safari reliability)
+        videoEl.addEventListener("loadeddata", onLoadedData);
+
+        // In case metadata never fires on some devices
+        safePlay();
+      } catch (e: unknown) {
+        console.error("[FaceCircleCapture5] getUserMedia error:", e);
+        const name = (e as { name?: string }).name || "Error";
+        setError(`Camera access failed: ${name}`);
+      }
+    })();
+
+    return () => {
+      mounted = false;
+
+      const videoEl = videoRef.current;
+      videoEl?.removeEventListener("loadeddata", onLoadedData);
+      if (videoEl) videoEl.onloadedmetadata = null;
+
+      // Stop tracks ONLY on iOS; do NOT stop on Android (prevents “won’t reopen” issues)
+      if (isIOS()) {
+        const tracks = streamRef.current?.getTracks() ?? [];
+        tracks.forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+
+      // Detach element either way (safe UI cleanup)
+      if (videoEl) videoEl.srcObject = null;
+      setVideoReady(false);
+    };
+  }, []);
+
+  // ------------------ MEDIAPIPE INIT (with SIMD + noSIMD fallback) ------------------
+  useEffect(() => {
+    let alive = true;
+
+    (async () => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let vision: any;
+
+        try {
+          // SIMD first
+          vision = await FilesetResolver.forVisionTasks("/mediapipe");
+        } catch (e) {
+          console.warn(
+            "MediaPipe SIMD init failed, falling back to no-SIMD:",
+            e
+          );
+          // In this example we just retry the same path; in a real app you might load a different bundle
+          vision = await FilesetResolver.forVisionTasks("/mediapipe");
+        }
+
+        const lm = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "/mediapipe/face_landmarker.task",
+          },
+          runningMode: "VIDEO",
+          numFaces: 1,
+        });
+
+        if (!alive) {
+          lm.close?.();
+          return;
+        }
+
+        setFaceLandmarker(lm);
+      } catch (e) {
+        console.error(e);
+        setError("Model load failed");
+      }
+    })();
+
+    return () => {
+      alive = false;
+      // best-effort cleanup
+      setFaceLandmarker((prev) => {
+        prev?.close?.();
+        return null;
+      });
+    };
+  }, []);
+
+  // ------------------ DETECTION LOOP (detectForVideo) ------------------
+  useEffect(() => {
+    function detect() {
+      try {
+        if (!faceLandmarker || !videoRef.current) return;
+
+        const videoEl = videoRef.current;
+
+        // Need current frame data
+        if (!videoEl || videoEl.readyState < 2) return;
+
+        const w = videoEl.videoWidth;
+        const h = videoEl.videoHeight;
+        if (!w || !h) return;
+
+        // monotonic timestamp
+        const now = performance.now();
+        const ts = now <= lastTsRef.current ? lastTsRef.current + 1 : now;
+        lastTsRef.current = ts;
+
+        // FAST + correct for VIDEO mode
+        const res = faceLandmarker.detectForVideo(videoEl, ts);
+
+        if (res.faceLandmarks?.[0]) {
+          const lm = res.faceLandmarks[0];
+
+          const noseX = lm[1].x;
+          const leftEyeOuterX = lm[33].x;
+          const rightEyeOuterX = lm[263].x;
+          const eyeCenterX = (leftEyeOuterX + rightEyeOuterX) / 2;
+
+          const mouthY = lm[13].y;
+          const leftEyeOuterY = lm[33].y;
+          const rightEyeOuterY = lm[263].y;
+          const eyeCenterY = (leftEyeOuterY + rightEyeOuterY) / 2;
+
+          const yawNorm = noseX - eyeCenterX;
+          const pitchNorm = mouthY - eyeCenterY;
+
+          const basics = { yawNorm, pitchNorm };
+          liveInfoRef.current.basics = basics;
+
+          // Gate → Detect
+          if (phase === "gate") {
+            const now2 = performance.now();
+            if (!gateHoldRef.current) gateHoldRef.current = now2;
+            else if (now2 - gateHoldRef.current >= GATE_HOLD_MS) {
+              setPhase("detect");
+              gateHoldRef.current = null;
+              straightStartRef.current = null;
+              bestStraightRef.current = null;
+            }
+          }
+
+          if (phase === "detect" && !baseline) {
+            if (!straightStartRef.current)
+              straightStartRef.current = performance.now();
+
+            if (
+              !bestStraightRef.current ||
+              straightScore(basics) > straightScore(bestStraightRef.current)
+            ) {
+              bestStraightRef.current = basics;
+            }
+          }
+        } else {
+          liveInfoRef.current.basics = null;
+          if (phase === "gate") gateHoldRef.current = null;
+        }
+      } catch (e) {
+        console.warn("detectForVideo failed:", e);
+      }
+    }
+
+    const interval = window.setInterval(detect, 110);
+    return () => clearInterval(interval);
+  }, [faceLandmarker, baseline, phase]);
+
+  // ------------------- DRAWING LOOP -------------------
+  useEffect(() => {
+    let frameId: number;
+
+    const draw = () => {
+      const canvas = canvasRef.current;
+      const container = containerRef.current;
+      if (!canvas || !container) {
+        frameId = requestAnimationFrame(draw);
+        return;
+      }
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        frameId = requestAnimationFrame(draw);
+        return;
+      }
+
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      canvas.width = w;
+      canvas.height = h;
+      ctx.clearRect(0, 0, w, h);
+
+      const basics = liveInfoRef.current.basics;
+
+      if (
+        phase === "detect" &&
+        videoReady &&
+        basics &&
+        !isCapturingRef.current &&
+        !showDone
+      ) {
+        const now = performance.now();
+        if (!baseline) handleStraightPhase(basics, now);
+        else runDirectionStep(basics, baseline, now);
+      }
+
+      if (phase === "detect" && baseline) {
+        drawPins4(ctx, w, h, capturesRef.current, currentDir);
+      }
+
+      frameId = requestAnimationFrame(draw);
+    };
+
+    frameId = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(frameId);
+  }, [baseline, videoReady, currentDir, showDone, phase]);
 
   // ----------------- UI -----------------
   return (
