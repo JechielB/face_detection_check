@@ -17,7 +17,7 @@ export default function TestHarness() {
               setStatus("Opening modal…");
               setOpen(true);
             }}
-            className="px-4 py-2 rounded-xl bg-white text-black font-semibold hover:opacity-90"
+            className="px-4 py-2 rounded-xl !bg-white !text-black font-semibold border border-white/20 hover:opacity-90"
           >
             Open Camera Modal
           </button>
