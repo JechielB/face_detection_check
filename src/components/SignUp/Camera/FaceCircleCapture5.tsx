@@ -1,5 +1,5 @@
 // src/components/SignUp/Camera/FaceCircleCapture5.tsx
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import { COLORS } from "../../../constants/theme";
 import { isIOS } from "../../../utils/cameraStream"; // keep your existing iOS detection
@@ -34,6 +34,7 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
     pitchNorm: number;
   } | null>(null);
 
+  // ✅ captures value is now used later (nextInstruction), so TS6133 is gone
   const [captures, setCaptures] = useState<Partial<Record<Direction, string>>>(
     {}
   );
@@ -54,31 +55,53 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
   // detectForVideo needs a monotonic timestamp
   const lastTsRef = useRef(0);
 
-  // ----------------------- CAMERA (iOS + Android verified fixes) -----------------------
+  // ----------------------- CAMERA (with robust getUserMedia guard) -----------------------
   useEffect(() => {
     let mounted = true;
-    const v = videoRef.current;
 
     const safePlay = async () => {
-      const vv = videoRef.current;
-      if (!vv) return;
+      const videoEl = videoRef.current;
+      if (!videoEl) return;
       try {
-        await vv.play();
+        await videoEl.play();
       } catch (e) {
         console.warn("video.play() failed:", e);
       }
     };
 
     const onLoadedData = () => {
-      // ✅ Fix #4: Safari sometimes ignores play() unless you retry on loadeddata
+      // Safari sometimes ignores play() unless you retry on loadeddata
       safePlay();
       setVideoReady(true);
     };
 
     (async () => {
       try {
-        // ✅ Fix #5: request front camera explicitly (Android needs this on many devices)
-        const stream = await navigator.mediaDevices.getUserMedia({
+        // ✅ Guard: only run when navigator exists (no SSR)
+        if (typeof navigator === "undefined") {
+          console.warn(
+            "[FaceCircleCapture5] navigator is undefined (SSR or non-browser env)"
+          );
+          setError("Camera not available in this environment.");
+          return;
+        }
+
+        // ✅ Guard: check mediaDevices + getUserMedia
+        const navAny = navigator as any;
+        const mediaDevices: MediaDevices | undefined =
+          (navigator as any).mediaDevices || navAny.mediaDevices;
+
+        if (!mediaDevices || typeof mediaDevices.getUserMedia !== "function") {
+          console.warn(
+            "[FaceCircleCapture5] navigator.mediaDevices.getUserMedia is not available",
+            navigator
+          );
+          setError("This browser does not support camera access.");
+          return;
+        }
+
+        // ✅ Request front camera explicitly
+        const stream = await mediaDevices.getUserMedia({
           video: {
             facingMode: { ideal: "user" },
             width: { ideal: 1280 },
@@ -95,41 +118,42 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
 
         streamRef.current = stream;
 
-        const vv = videoRef.current;
-        if (!vv) return;
+        const videoEl = videoRef.current;
+        if (!videoEl) return;
 
-        vv.srcObject = stream;
+        videoEl.srcObject = stream;
 
-        // ✅ Fix #3: iOS Safari playsInline must be set as attributes (not only React prop)
-        vv.setAttribute("playsinline", "true");
-        vv.setAttribute("webkit-playsinline", "true");
-        vv.muted = true; // helps autoplay on mobile
+        // iOS Safari playsInline must be set as attributes (not only React prop)
+        videoEl.setAttribute("playsinline", "true");
+        videoEl.setAttribute("webkit-playsinline", "true");
+        videoEl.muted = true; // helps autoplay on mobile
 
         // metadata -> play attempt #1
-        vv.onloadedmetadata = () => {
+        videoEl.onloadedmetadata = () => {
           safePlay();
           setVideoReady(true);
         };
 
-        // ✅ Fix #4: play attempt #2 (Safari reliability)
-        vv.addEventListener("loadeddata", onLoadedData);
+        // play attempt #2 (Safari reliability)
+        videoEl.addEventListener("loadeddata", onLoadedData);
 
         // In case metadata never fires on some devices
         safePlay();
-      } catch (e) {
-        console.error(e);
-        setError("Camera access failed");
+      } catch (e: any) {
+        console.error("[FaceCircleCapture5] getUserMedia error:", e);
+        const name = e?.name || "Error";
+        setError(`Camera access failed: ${name}`);
       }
     })();
 
     return () => {
       mounted = false;
 
-      const vv = videoRef.current;
-      vv?.removeEventListener("loadeddata", onLoadedData);
-      if (vv) vv.onloadedmetadata = null;
+      const videoEl = videoRef.current;
+      videoEl?.removeEventListener("loadeddata", onLoadedData);
+      if (videoEl) videoEl.onloadedmetadata = null;
 
-      // ✅ Fix #6: stop tracks ONLY on iOS; do NOT stop on Android (prevents “won’t reopen” issues)
+      // Stop tracks ONLY on iOS; do NOT stop on Android (prevents “won’t reopen” issues)
       if (isIOS()) {
         const tracks = streamRef.current?.getTracks() ?? [];
         tracks.forEach((t) => t.stop());
@@ -137,7 +161,7 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
       }
 
       // Detach element either way (safe UI cleanup)
-      if (vv) vv.srcObject = null;
+      if (videoEl) videoEl.srcObject = null;
       setVideoReady(false);
     };
   }, []);
@@ -158,6 +182,7 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
             "MediaPipe SIMD init failed, falling back to no-SIMD:",
             e
           );
+          // In this example we just retry the same path; in a real app you might load a different bundle
           vision = await FilesetResolver.forVisionTasks("/mediapipe");
         }
 
@@ -199,13 +224,13 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
       try {
         if (!faceLandmarker || !videoRef.current) return;
 
-        const v = videoRef.current;
+        const videoEl = videoRef.current;
 
         // Need current frame data
-        if (v.readyState < 2) return;
+        if (!videoEl || videoEl.readyState < 2) return;
 
-        const w = v.videoWidth;
-        const h = v.videoHeight;
+        const w = videoEl.videoWidth;
+        const h = videoEl.videoHeight;
         if (!w || !h) return;
 
         // monotonic timestamp
@@ -213,8 +238,8 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
         const ts = now <= lastTsRef.current ? lastTsRef.current + 1 : now;
         lastTsRef.current = ts;
 
-        // ✅ FAST + correct for VIDEO mode
-        const res = faceLandmarker.detectForVideo(v, ts);
+        // FAST + correct for VIDEO mode
+        const res = faceLandmarker.detectForVideo(videoEl, ts);
 
         if (res.faceLandmarks?.[0]) {
           const lm = res.faceLandmarks[0];
@@ -398,11 +423,11 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
 
   // ----------------- CAPTURE LOGIC -----------------
   function doCapture(dir: Direction) {
-    const v = videoRef.current;
-    if (!v) return;
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
 
-    const w = v.videoWidth;
-    const h = v.videoHeight;
+    const w = videoEl.videoWidth;
+    const h = videoEl.videoHeight;
     if (!w || !h) return;
 
     const c = document.createElement("canvas");
@@ -411,7 +436,7 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
     const ctx = c.getContext("2d");
     if (!ctx) return;
 
-    ctx.drawImage(v, 0, 0, w, h);
+    ctx.drawImage(videoEl, 0, 0, w, h);
     const img = c.toDataURL("image/jpeg", 0.9);
 
     isCapturingRef.current = true;
@@ -476,8 +501,10 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
     if (showDone) return null;
     if (phase === "gate") return "center";
     if (!baseline) return "straight";
+
+    // ✅ use the `captures` state value here to satisfy TS
     for (const d of DISPLAY_ORDER) {
-      if (!capturesRef.current[d]) return d;
+      if (!captures[d]) return d;
     }
     return null;
   })();
@@ -528,7 +555,7 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
       {!showDone && (
         <button
           onClick={onCancel}
-          className="text-xs px-5 py-2 rounded-full bg-black border border-white/20 text-white/80 hover:bg-white/5 transition"
+          className="text-xs px-5 py-2 rounded-full bg-black border border-white/20 text-white/80 hover:bg:white/5 transition"
         >
           Cancel
         </button>
@@ -563,7 +590,7 @@ export default function FaceCircleCapture5({ onComplete, onCancel }: Props) {
       )}
 
       {error && (
-        <p className="absolute bottom-4 text-red-400 text-xs bg-red-500/5 border border-red-500/30 px-3 py-2 rounded-lg">
+        <p className="absolute bottom-4 text-red-400 text-xs bg-red-500/5 border border-red-500/30 px-3 py-2 rounded-lg max-w-xs text-center">
           {error}
         </p>
       )}

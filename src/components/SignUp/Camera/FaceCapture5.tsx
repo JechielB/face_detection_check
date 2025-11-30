@@ -1,4 +1,3 @@
-import React from "react";
 import FaceCircleCapture5 from "./FaceCircleCapture5";
 
 type Props = { onComplete: (images: string[]) => void; onCancel: () => void };

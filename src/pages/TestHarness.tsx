@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import CameraModal from "../modals/CameraModal";
 
 export default function TestHarness() {

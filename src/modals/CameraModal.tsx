@@ -1,4 +1,3 @@
-import React from "react";
 import { useNavigate } from "react-router-dom";
 import FaceCapture5 from "../components/SignUp/Camera/FaceCapture5";
 
